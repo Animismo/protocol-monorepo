@@ -232,6 +232,7 @@ module.exports = eval(`(${S.toString()})({skipArgv: true})`)(async function (
         "PoolAdminNFT",
         "PoolMemberNFT",
         "IAccessControlEnumerable",
+        "SimpleForwarder",
         "ERC2771Forwarder",
     ];
     const mockContracts = [
@@ -270,6 +271,7 @@ module.exports = eval(`(${S.toString()})({skipArgv: true})`)(async function (
         PoolAdminNFT,
         PoolMemberNFT,
         IAccessControlEnumerable,
+        SimpleForwarder,
         ERC2771Forwarder,
     } = await SuperfluidSDK.loadContracts({
         ...extractWeb3Options(options),
@@ -351,6 +353,10 @@ module.exports = eval(`(${S.toString()})({skipArgv: true})`)(async function (
         `Superfluid.${protocolReleaseVersion}`,
         async (contractAddress) => !(await hasCode(web3, contractAddress)),
         async () => {
+            const simpleForwarder = await web3tx(SimpleForwarder.new, "SimpleForwarder.new")();
+            console.log("SimpleForwarder address:", simpleForwarder.address);
+            output += `SIMPLE_FORWARDER=${simpleForwarder.address}\n`;
+
             const erc2771Forwarder = await web3tx(ERC2771Forwarder.new, "ERC2771Forwarder.new")();
             console.log("ERC2771Forwarder address:", erc2771Forwarder.address);
             output += `ERC2771_FORWARDER=${erc2771Forwarder.address}\n`;
@@ -359,15 +365,12 @@ module.exports = eval(`(${S.toString()})({skipArgv: true})`)(async function (
             const superfluidLogic = await web3tx(
                 SuperfluidLogic.new,
                 "SuperfluidLogic.new"
-            )(nonUpgradable, appWhiteListing, appCallbackGasLimit, erc2771Forwarder.address);
+            )(nonUpgradable, appWhiteListing, appCallbackGasLimit, simpleForwarder.address, erc2771Forwarder.address);
             console.log(
                 `Superfluid new code address ${superfluidLogic.address}`
             );
             output += `SUPERFLUID_HOST_LOGIC=${superfluidLogic.address}\n`;
-            // get the address of SimpleForwarder (deployed in constructor) for verification
-            const simpleForwarderAddr = await superfluidLogic.SIMPLE_FORWARDER();
-            console.log("SimpleForwarder address", simpleForwarderAddr);
-            output += `SIMPLE_FORWARDER=${simpleForwarderAddr}\n`;
+
             if (!nonUpgradable) {
                 const proxy = await web3tx(
                     UUPSProxy.new,
@@ -384,9 +387,14 @@ module.exports = eval(`(${S.toString()})({skipArgv: true})`)(async function (
             }
             const superfluid = await Superfluid.at(superfluidAddress);
             await web3tx(
+                simpleForwarder.transferOwnership,
+                "simpleForwarder.transferOwnership"
+            )(superfluid.address);
+            await web3tx(
                 erc2771Forwarder.transferOwnership,
                 "erc2771Forwarder.transferOwnership"
             )(superfluid.address);
+
             await web3tx(
                 superfluid.initialize,
                 "Superfluid.initialize"
@@ -784,33 +792,60 @@ module.exports = eval(`(${S.toString()})({skipArgv: true})`)(async function (
             throw new Error("Superfluid is not upgradable");
         }
 
-        async function getPrevERC2771ForwarderAddr() {
-            try {
-                return await superfluid.getERC2771Forwarder();
-            } catch (err) {
-                console.error("### Error getting ERC2771Forwarder address, likely not yet deployed");
-                return ZERO_ADDRESS; // fallback
-            }
-        }
-        const prevERC2771ForwarderAddr = await getPrevERC2771ForwarderAddr();
+        async function getOrDeployForwarder(
+            superfluid,
+            ForwarderContract,
+            getPrevAddrFn,
+            outputKey
+        ) {
+            let prevAddr = await getPrevAddrFn().catch(_err => {
+                console.error(`### Error getting ${ForwarderContract.contractName} address, likely not yet deployed`);
+                return ZERO_ADDRESS;
+            });
 
-        const erc2771ForwarderNewAddress = await deployContractIfCodeChanged(
-            web3,
-            ERC2771Forwarder,
-            prevERC2771ForwarderAddr,
-            async () => {
-                const erc2771Forwarder = await web3tx(ERC2771Forwarder.new, "ERC2771Forwarder.new")();
-                await web3tx(
-                    erc2771Forwarder.transferOwnership,
-                    "erc2771Forwarder.transferOwnership"
-                )(superfluid.address);
-                output += `ERC2771_FORWARDER=${erc2771Forwarder.address}\n`;
-                return erc2771Forwarder.address;
+            {
+                // TEMPORARY FIX - can be removed after applied
+                // we found a previous deployment. Now verify it has the host as owner.
+                // the first mainnet deployment didn't have this for SimpleForwarder, thus needs a redeployment.
+                const ownerAddr = await (await Ownable.at(prevAddr)).owner();
+                if (ownerAddr != superfluid.address) {
+                    console.log(`  !!! ${outputKey} has wrong owner, needs re-deployment`);
+                    prevAddr = ZERO_ADDRESS; // by setting zero, we force a re-deployment
+                }
             }
+
+            const newAddress = await deployContractIfCodeChanged(
+                web3,
+                ForwarderContract,
+                prevAddr,
+                async () => {
+                    const forwarder = await web3tx(ForwarderContract.new, `${ForwarderContract.contractName}.new`)();
+                    await web3tx(
+                        forwarder.transferOwnership,
+                        "forwarder.transferOwnership"
+                    )(superfluid.address);
+
+                    output += `${outputKey}=${forwarder.address}\n`;
+                    return forwarder.address;
+                }
+            );
+
+            return newAddress !== ZERO_ADDRESS ? newAddress : prevAddr;
+        }
+
+        const simpleForwarderAddress = await getOrDeployForwarder(
+            superfluid,
+            SimpleForwarder,
+            () => superfluid.SIMPLE_FORWARDER(),
+            "SIMPLE_FORWARDER"
         );
-        const erc2771ForwarderAddress = erc2771ForwarderNewAddress !== ZERO_ADDRESS
-            ? erc2771ForwarderNewAddress
-            : prevERC2771ForwarderAddr;
+
+        const erc2771ForwarderAddress = await getOrDeployForwarder(
+            superfluid,
+            ERC2771Forwarder,
+            () => superfluid.getERC2771Forwarder(),
+            "ERC2771_FORWARDER"
+        );
 
         // get previous callback gas limit, make sure we don't decrease it
         const prevCallbackGasLimit = await superfluid.CALLBACK_GAS_LIMIT();
@@ -820,13 +855,6 @@ module.exports = eval(`(${S.toString()})({skipArgv: true})`)(async function (
             console.log(` !!! CHANGING APP CALLBACK GAS LIMIT FROM ${prevCallbackGasLimit} to ${appCallbackGasLimit} !!!`);
         }
 
-        // get prev SimpleForwarder addr (only for replacements for codeChanged check)
-        let simpleForwarderAddr;
-        try {
-            simpleForwarderAddr = await superfluid.SIMPLE_FORWARDER();
-        } catch (error) {
-            simpleForwarderAddr = ZERO_ADDRESS;
-        }
         // deploy new superfluid host logic
         superfluidNewLogicAddress = await deployContractIfCodeChanged(
             web3,
@@ -839,13 +867,13 @@ module.exports = eval(`(${S.toString()})({skipArgv: true})`)(async function (
                 const superfluidLogic = await web3tx(
                     SuperfluidLogic.new,
                     "SuperfluidLogic.new"
-                )(nonUpgradable, appWhiteListing, appCallbackGasLimit, erc2771ForwarderAddress);
+                )(nonUpgradable, appWhiteListing, appCallbackGasLimit, simpleForwarderAddress, erc2771ForwarderAddress);
                 output += `SUPERFLUID_HOST_LOGIC=${superfluidLogic.address}\n`;
                 return superfluidLogic.address;
             },
             [
                 ap(erc2771ForwarderAddress),
-                ap(simpleForwarderAddr),
+                ap(simpleForwarderAddress),
                 appCallbackGasLimit.toString(16).padStart(64, "0")
             ],
         );
